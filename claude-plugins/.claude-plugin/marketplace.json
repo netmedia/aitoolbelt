@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "local",
+  "description": "Local custom plugins by Netmedia",
+  "owner": {
+    "name": "Netmedia",
+    "email": "netmedia@netmedia.hr",
+    "homepage": "https://netmedia.agency"
+  },
+  "plugins": [
+    {
+      "name": "efcore-gdpr-obfuscate",
+      "description": "Scans EF Core migration files to detect GDPR-sensitive columns and generates an idempotent, deterministic SQL Server obfuscation script for dev/test environments.",
+      "author": {
+        "name": "Netmedia",
+        "email": "netmedia@netmedia.hr",
+        "homepage": "https://netmedia.agency"
+      },
+      "source": "./plugins/efcore-gdpr-obfuscate",
+      "category": "development"
+    }
+  ]
+}
