@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 #  ╔══════════════════════════════════════════════════════════════════════════╗
 #  ║   netmedia-nm-protect-solution.ps1                                         ║
@@ -61,6 +61,22 @@
     Creates a backup branch automatically.  Prompts for confirmation unless
     -Force is also supplied.
 
+.PARAMETER Use1Password
+    Replace .NET User Secrets with 1Password CLI (op) storage.
+    Secrets are stored in 1Password vault items:
+      {1PasswordPrefix}-solution   — solution-level configs (solutionsettings*.json at root)
+      {1PasswordPrefix}-{Project}  — project-level configs (appsettings*.json inside a project)
+    Each project gets an OpSecretsLoader.cs helper and a .env.op reference file.
+    Requires the 1Password CLI (op) to be installed and signed in.
+
+.PARAMETER 1PasswordPrefix
+    Prefix for 1Password item titles when -Use1Password is set.
+    Defaults to the .sln file base name (lowercased) if omitted.
+    Example: "myapp" → items named "myapp-solution", "myapp-backofficeapi".
+
+.PARAMETER 1PasswordVault
+    Name of the 1Password vault to use. Defaults to "Personal".
+
 .PARAMETER Help
     Display this usage guide and exit.
 
@@ -84,6 +100,14 @@
 .EXAMPLE
     # Erase sensitive files from full git history (destructive — rewrites all SHAs)
     nm-protect-solution.ps1 C:\projects\MyApp -SkipUserSecrets -UntrackSensitiveFiles -PurgeHistory
+
+.EXAMPLE
+    # Store secrets in 1Password (items: myapp-solution, myapp-backofficeapi)
+    nm-protect-solution.ps1 C:\projects\MyApp -Use1Password -1PasswordPrefix myapp
+
+.EXAMPLE
+    # 1Password with custom vault
+    nm-protect-solution.ps1 C:\projects\MyApp -Use1Password -1PasswordPrefix myapp -1PasswordVault Employee
 
 .NOTES
     Store this script in a central location (e.g. C:\scripts\) and call it with
@@ -115,7 +139,11 @@ param(
 
     [string[]]$ExtraIgnorePatterns = @(),
 
-    [switch]$PurgeHistory
+    [switch]$PurgeHistory,
+
+    [switch]$Use1Password,
+    [string]${1PasswordPrefix} = '',
+    [string]${1PasswordVault}  = 'Personal'
 )
 
 Set-StrictMode -Version Latest
@@ -473,12 +501,350 @@ function Invoke-SetUserSecret([System.IO.FileInfo]$Proj, [string]$Key, [string]$
     if ($LASTEXITCODE -ne 0) { Write-Warn "  Failed to set '$Key': $out" }
 }
 
+# ─── 1PASSWORD HELPERS ────────────────────────────────────────────────────────
+
+function Test-1PasswordCli {
+    try {
+        & op --version 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Test-1PasswordSignedIn {
+    try {
+        & op account list 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Get-1PasswordItemFields([string]$ItemTitle, [string]$Vault) {
+    # Returns ordered hashtable label->value for the item, or $null if item not found
+    try {
+        $json = & op item get $ItemTitle --vault $Vault --format json 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $item   = $json | ConvertFrom-Json
+        $fields = [ordered]@{}
+        foreach ($f in $item.fields) {
+            if ($null -ne $f.label) { $fields[$f.label] = $f.value }
+        }
+        return $fields
+    } catch { return $null }
+}
+
+# Cache so we only call op item get once per item per run
+$script:OpItemFieldsCache = [ordered]@{}
+
+function Get-1PasswordItemFieldsCached([string]$ItemTitle, [string]$Vault) {
+    $key = "$Vault/$ItemTitle"
+    if (-not $script:OpItemFieldsCache.Contains($key)) {
+        $script:OpItemFieldsCache[$key] = Get-1PasswordItemFields -ItemTitle $ItemTitle -Vault $Vault
+    }
+    return $script:OpItemFieldsCache[$key]
+}
+
+function Initialize-1PasswordItem([string]$ItemTitle, [string]$Vault) {
+    $fields = Get-1PasswordItemFieldsCached -ItemTitle $ItemTitle -Vault $Vault
+    if ($null -ne $fields) {
+        Write-Skip "1Password item already exists: $ItemTitle  (vault: $Vault)"
+        return $true
+    }
+    Write-Step "Creating 1Password item: '$ItemTitle'  (vault: $Vault)"
+    if ($DryRun) {
+        Write-Info "  [dry] op item create --vault `"$Vault`" --title `"$ItemTitle`" --category `"Secure Note`""
+        $script:OpItemFieldsCache["$Vault/$ItemTitle"] = [ordered]@{}
+        return $true
+    }
+    $out = & op item create --vault $Vault --title $ItemTitle --category 'Secure Note' 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warn "  Failed to create item '$ItemTitle': $out"; return $false }
+    $script:OpItemFieldsCache["$Vault/$ItemTitle"] = [ordered]@{}
+    Write-OK "Created 1Password item: $ItemTitle"
+    return $true
+}
+
+function Invoke-Set1PasswordField {
+    param([string]$ItemTitle, [string]$Vault, [string]$FieldName, [string]$Value)
+    $fields = Get-1PasswordItemFieldsCached -ItemTitle $ItemTitle -Vault $Vault
+    if ($null -ne $fields -and $fields.Contains($FieldName)) {
+        Write-Skip "    Field already exists (not overwritten): $FieldName"
+        return
+    }
+    if ($DryRun) {
+        Write-Info "    [dry] op item edit `"$ItemTitle`" `"$FieldName[password]=<redacted>`""
+        return
+    }
+    $assignment = "$FieldName[password]=$Value"
+    $out = & op item edit $ItemTitle --vault $Vault $assignment 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "    Failed to set field '$FieldName': $out"
+    } else {
+        # Invalidate cache so next read picks up the new field
+        $script:OpItemFieldsCache.Remove("$Vault/$ItemTitle")
+        Write-OK "    Stored field: $FieldName"
+    }
+}
+
+# Accumulate op:// references for .env.op files: itemName -> list of "ENVVAR=op://..." lines
+$script:OpEnvRefs = [ordered]@{}
+
+function Add-OpEnvRef([string]$ItemTitle, [string]$Vault, [string]$FieldName) {
+    # JSON colon-path -> env-var double-underscore
+    $envVarName = $FieldName -replace ':', '__'
+    $opRef      = "op://$Vault/$ItemTitle/$FieldName"
+    if (-not $script:OpEnvRefs.Contains($ItemTitle)) {
+        $script:OpEnvRefs[$ItemTitle] = [System.Collections.Generic.List[string]]::new()
+    }
+    $script:OpEnvRefs[$ItemTitle].Add("$envVarName=$opRef")
+}
+
+function Get-1PasswordItemName {
+    param(
+        [string]              $ConfigPath,
+        [string]              $Root,
+        [System.IO.FileInfo[]]$Projects,
+        [string]              $Prefix
+    )
+    $configDir = [IO.Path]::GetDirectoryName($ConfigPath)
+    foreach ($proj in $Projects) {
+        $projDir = $proj.DirectoryName
+        if ($configDir.StartsWith($projDir, [StringComparison]::OrdinalIgnoreCase)) {
+            return ("$Prefix-$($proj.BaseName)").ToLower()
+        }
+    }
+    return "$Prefix-solution".ToLower()
+}
+
+function Write-DotEnvOpFiles {
+    param([string]$Root, [System.IO.FileInfo[]]$Projects, [string]$Prefix)
+
+    foreach ($itemName in $script:OpEnvRefs.Keys) {
+        $header = @(
+            "# 1Password secrets — generated by nm-protect-solution.ps1",
+            "# Run with: op run --env-file .env.op -- dotnet run",
+            "# Or:       op run --env-file .env.op -- dotnet watch",
+            ""
+        )
+        $newEntries = $script:OpEnvRefs[$itemName]
+
+        # Determine target path
+        $isSolution = ($itemName -eq "$Prefix-solution".ToLower())
+        if ($isSolution) {
+            $targetPath = Join-Path $Root '.env.op'
+        } else {
+            $projSuffix = $itemName.Substring($Prefix.Length + 1)
+            $matchProj  = $Projects | Where-Object { $_.BaseName.ToLower() -eq $projSuffix } | Select-Object -First 1
+            $targetPath = if ($matchProj) { Join-Path $matchProj.DirectoryName '.env.op' }
+                          else            { Join-Path $Root ".env.op.$itemName" }
+        }
+
+        if ($DryRun) {
+            Write-Info "  [dry] Would write/update .env.op → $($targetPath.Replace($Root,'.'))"
+            $newEntries | ForEach-Object { Write-Info "    $_" }
+            continue
+        }
+
+        # Idempotent merge: keep existing lines, append only new keys
+        $existingLines = @()
+        $existingKeys  = @{}
+        if (Test-Path $targetPath) {
+            $existingLines = [IO.File]::ReadAllLines($targetPath)
+            foreach ($l in $existingLines) {
+                if ($l -match '^([^#=][^=]*)=') { $existingKeys[$Matches[1].Trim()] = $true }
+            }
+        }
+
+        $linesToAdd = @($newEntries | Where-Object {
+            if ($_ -match '^([^=]+)=') { -not $existingKeys.ContainsKey($Matches[1].Trim()) }
+            else { $false }
+        })
+
+        if ($linesToAdd.Count -eq 0 -and $existingLines.Count -gt 0) {
+            Write-Skip ".env.op already up-to-date → $($targetPath.Replace($Root,'.'))"
+            continue
+        }
+
+        $finalLines = if ($existingLines.Count -gt 0) { $existingLines + $linesToAdd }
+                      else                            { $header + $newEntries }
+        [IO.File]::WriteAllLines($targetPath, $finalLines, [Text.Encoding]::UTF8)
+        Write-OK "Updated .env.op → $($targetPath.Replace($Root,'.'))"
+    }
+}
+
+function Add-1PasswordCodeIntegration {
+    param([System.IO.FileInfo[]]$Projects, [string]$Root)
+
+    foreach ($proj in $Projects) {
+        $projDir = $proj.DirectoryName
+        $ns      = $proj.BaseName
+
+        # ── Generate OpSecretsLoader.cs ────────────────────────────────────────
+        $loaderPath = Join-Path $projDir 'OpSecretsLoader.cs'
+
+        if (-not (Test-Path $loaderPath)) {
+            $loaderContent = @"
+// Auto-generated by nm-protect-solution.ps1 — do not edit manually
+// 1Password secrets loader — active only in Development environment
+
+using System.Diagnostics;
+
+namespace $ns;
+
+internal static class OpSecretsExtensions
+{
+    /// <summary>
+    /// Loads secrets from 1Password (via the <c>op</c> CLI) in Development.
+    /// Reads all <c>.env.op</c> files found in the project directory and up the
+    /// directory tree (for solution-level secrets), resolves each
+    /// <c>op://vault/item/field</c> reference and injects values into
+    /// IConfiguration as in-memory key/value pairs.
+    /// No-ops in any environment other than Development.
+    /// </summary>
+    /// <param name="builder">The <see cref="WebApplicationBuilder"/>.</param>
+    /// <param name="envOpFile">Name of the env-op file. Default: <c>.env.op</c>.</param>
+    public static WebApplicationBuilder AddOpSecrets(
+        this WebApplicationBuilder builder,
+        string envOpFile = ".env.op")
+    {
+        if (!builder.Environment.IsDevelopment())
+            return builder;
+
+        var settings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var path in FindEnvOpFiles(envOpFile))
+            LoadEnvOpFile(path, settings);
+
+        if (settings.Count > 0)
+            builder.Configuration.AddInMemoryCollection(settings);
+
+        return builder;
+    }
+
+    // Walk from the current working directory up to the repo root,
+    // collecting every .env.op file found (project-level first, then solution-level).
+    private static IEnumerable<string> FindEnvOpFiles(string fileName)
+    {
+        var dir = Directory.GetCurrentDirectory();
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir, fileName);
+            if (File.Exists(candidate))
+                yield return candidate;
+
+            var parent = Directory.GetParent(dir)?.FullName;
+            if (parent is null || parent == dir) break;
+            dir = parent;
+        }
+    }
+
+    private static void LoadEnvOpFile(string path, Dictionary<string, string?> settings)
+    {
+        foreach (var line in File.ReadAllLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith('#'))
+                continue;
+
+            var idx = line.IndexOf('=');
+            if (idx < 0) continue;
+
+            var envKey = line[..idx].Trim();
+            var opRef  = line[(idx + 1)..].Trim();
+
+            if (!opRef.StartsWith("op://", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // env var uses __ as hierarchy separator; config uses :
+            var configKey = envKey.Replace("__", ":");
+
+            // Skip keys already loaded (project-level wins over solution-level)
+            if (settings.ContainsKey(configKey)) continue;
+
+            var value = ReadOpSecret(opRef);
+            if (value is not null)
+                settings[configKey] = value;
+        }
+    }
+
+    private static string? ReadOpSecret(string opRef)
+    {
+        try
+        {
+            using var proc = new Process
+            {
+                StartInfo = new ProcessStartInfo("op", `$"read \"{opRef}\"")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError  = true,
+                    UseShellExecute        = false,
+                    CreateNoWindow         = true,
+                }
+            };
+            proc.Start();
+            var output = proc.StandardOutput.ReadToEnd().Trim();
+            proc.WaitForExit();
+            return proc.ExitCode == 0 ? output : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+"@
+            if (-not $DryRun) {
+                [IO.File]::WriteAllText($loaderPath, $loaderContent, [Text.Encoding]::UTF8)
+                Write-OK "Generated OpSecretsLoader.cs → $($projDir.Replace($Root,'.'))"
+            } else {
+                Write-Info "  [dry] Would generate OpSecretsLoader.cs → $($projDir.Replace($Root,'.'))"
+            }
+        } else {
+            Write-Skip "OpSecretsLoader.cs already exists → $($projDir.Replace($Root,'.'))"
+        }
+
+        # ── Modify Program.cs ──────────────────────────────────────────────────
+        $programPath = Join-Path $projDir 'Program.cs'
+        if (-not (Test-Path $programPath)) { continue }
+
+        $programContent = [IO.File]::ReadAllText($programPath)
+
+        if ($programContent -match 'AddOpSecrets') {
+            Write-Skip "Program.cs already contains AddOpSecrets() → $($projDir.Replace($Root,'.'))"
+            continue
+        }
+
+        $lines = $programContent -split "`r?`n"
+        $insertIdx = -1
+
+        # Prefer inserting after AddUserSecrets line; otherwise after CreateBuilder line
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match 'WebApplication\.CreateBuilder') { $insertIdx = $i }
+        }
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match 'AddUserSecrets')                { $insertIdx = $i }
+        }
+
+        $callLine = 'builder.AddOpSecrets(); // 1Password: loads .env.op secrets in Development'
+
+        if ($insertIdx -ge 0) {
+            $updated = ($lines[0..$insertIdx] + @($callLine) + $lines[($insertIdx + 1)..($lines.Count - 1)]) -join "`r`n"
+            if (-not $DryRun) {
+                [IO.File]::WriteAllText($programPath, $updated, [Text.Encoding]::UTF8)
+                Write-OK "Updated Program.cs with AddOpSecrets() → $($projDir.Replace($Root,'.'))"
+            } else {
+                Write-Info "  [dry] Would insert into Program.cs: $callLine"
+            }
+        } else {
+            Write-Warn "Could not locate insertion point in Program.cs — add manually:"
+            Write-Info "  $callLine"
+        }
+    }
+}
+
 # ─── CONFIG PROCESSING ────────────────────────────────────────────────────────
 
 function Invoke-ProcessJsonConfig {
     param(
         [string]              $Path,
-        [System.IO.FileInfo[]]$Projects   # startup projects to store secrets in
+        [System.IO.FileInfo[]]$Projects,   # startup projects to store secrets in
+        [string]              $ItemName = ''
     )
     $name = [IO.Path]::GetFileName($Path)
     $raw  = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
@@ -518,8 +884,11 @@ function Invoke-ProcessJsonConfig {
     foreach ($kv in $hits.GetEnumerator()) {
         Write-Info "    $($kv.Key)"
 
-        # Store in User Secrets for each startup project
-        if (-not $SkipUserSecrets) {
+        # Store in 1Password or User Secrets
+        if ($Use1Password -and $ItemName) {
+            Add-OpEnvRef       -ItemTitle $ItemName -Vault ${1PasswordVault} -FieldName $kv.Key
+            Invoke-Set1PasswordField -ItemTitle $ItemName -Vault ${1PasswordVault} -FieldName $kv.Key -Value $kv.Value
+        } elseif (-not $SkipUserSecrets) {
             foreach ($proj in $Projects) {
                 Invoke-SetUserSecret -Proj $proj -Key $kv.Key -Value $kv.Value
             }
@@ -534,8 +903,9 @@ function Invoke-ProcessJsonConfig {
         [IO.File]::WriteAllText($Path, $sanitized, [Text.Encoding]::UTF8)
     }
 
-    $dest = if ($SkipUserSecrets) { "placeholder only (User Secrets skipped)" }
-            else                  { "User Secrets + placeholder" }
+    $dest = if ($Use1Password -and $ItemName) { "1Password item '$ItemName' + placeholder" }
+            elseif ($SkipUserSecrets)         { "placeholder only (User Secrets skipped)" }
+            else                              { "User Secrets + placeholder" }
     Write-OK "$name — $($hits.Count) value(s) extracted → $dest"
 }
 
@@ -760,6 +1130,16 @@ function Show-Usage {
     & $d  '    Rewrite git history to permanently remove sensitive file paths using'
     & $d  '    git-filter-repo (pip install git-filter-repo).  Creates a backup'
     & $d  '    branch first.  Prompts for confirmation unless -Force is also given.'
+    & $y  '  -Use1Password'
+    & $d  '    Replace .NET User Secrets with 1Password CLI (op) storage.'
+    & $d  '    Creates/updates vault items {prefix}-solution and {prefix}-{project}.'
+    & $d  '    Generates .env.op reference files and OpSecretsLoader.cs per project.'
+    & $d  '    Requires op CLI installed and signed in.'
+    & $y  '  -1PasswordPrefix <string>'
+    & $d  '    Prefix for 1Password item titles. Defaults to the .sln base name.'
+    & $d  '    Example: "myapp" → items "myapp-solution", "myapp-backofficeapi".'
+    & $y  '  -1PasswordVault <string>'
+    & $d  '    1Password vault name. Default: "Personal".'
     & $y  '  -Help  (-h)'
     & $d  '    Show this usage guide and exit.'
     Write-Host ''
@@ -778,6 +1158,9 @@ function Show-Usage {
     & $d  '     to untrack them (-UntrackSensitiveFiles) or prints git rm commands'
     & $d  ' 10. [optional] Rewrites full git history to erase sensitive paths using'
     & $d  '     git-filter-repo  (-PurgeHistory)'
+    & $d  ' 11. [-Use1Password] Creates/updates 1Password vault items with sensitive values,'
+    & $d  '     generates .env.op reference files, and injects OpSecretsLoader.cs + call'
+    & $d  '     into each startup project''s Program.cs (Development-guarded).'
     & $d  '  Idempotent — safe to run multiple times on the same solution.'
     Write-Host ''
     & $b  'EXAMPLES'
@@ -799,6 +1182,12 @@ function Show-Usage {
     Write-Host ''
     & $g  '  # Permanently erase sensitive files from full git history (destructive)'
     & $g  '  C:\scripts\nm-protect-solution.ps1  C:\projects\MyApp  -SkipUserSecrets  -UntrackSensitiveFiles  -PurgeHistory'
+    Write-Host ''
+    & $g  '  # Store secrets in 1Password (items: myapp-solution, myapp-backofficeapi)'
+    & $g  '  C:\scripts\nm-protect-solution.ps1  C:\projects\MyApp  -Use1Password  -1PasswordPrefix myapp'
+    Write-Host ''
+    & $g  '  # 1Password with a custom vault'
+    & $g  '  C:\scripts\nm-protect-solution.ps1  C:\projects\MyApp  -Use1Password  -1PasswordPrefix myapp  -1PasswordVault Employee'
     Write-Host ''
     & $b  'AFTER RUNNING'
     & $d  '  - Commit .gitignore and .claudeignore.'
@@ -861,18 +1250,55 @@ if ($startupProjects.Count -eq 0) {
     $startupProjects | ForEach-Object { Write-Info $_.Name }
 }
 
-# ── 2. Initialize User Secrets ────────────────────────────────────────────────
-Write-Banner "[2/8] Initialize User Secrets"
+# ── 2. Initialize User Secrets or 1Password items ─────────────────────────────
 $readyProjects = @()
-if ($SkipUserSecrets) {
-    Write-Skip "Skipped (--SkipUserSecrets)"
+
+if ($Use1Password) {
+    Write-Banner "[2/8] Initialize 1Password Items"
+
+    # Resolve prefix: default to .sln name (lowercased)
+    if ([string]::IsNullOrWhiteSpace(${1PasswordPrefix})) {
+        ${1PasswordPrefix} = if ($slnFile) { $slnFile.BaseName.ToLower() } else { 'solution' }
+        Write-Info "1PasswordPrefix not set — using '${1PasswordPrefix}' (from .sln name)"
+    }
+
+    # Check op CLI
+    if (-not (Test-1PasswordCli)) {
+        Write-Err "1Password CLI (op) not found in PATH."
+        Write-Info "  Install: https://developer.1password.com/docs/cli/get-started/"
+        exit 1
+    }
+    if (-not (Test-1PasswordSignedIn)) {
+        Write-Err "1Password CLI is not signed in. Run: op signin"
+        exit 1
+    }
+    Write-OK "1Password CLI detected and signed in"
+    Write-Info "  Vault  : ${1PasswordVault}"
+    Write-Info "  Prefix : ${1PasswordPrefix}"
+
+    $SkipUserSecrets = $true   # 1Password replaces User Secrets
+
+    # Pre-create items we know we'll need (solution + one per startup project)
+    $itemNames = @("${1PasswordPrefix}-solution".ToLower())
+    foreach ($proj in $startupProjects) {
+        $itemNames += ("${1PasswordPrefix}-$($proj.BaseName)".ToLower())
+    }
+    foreach ($iName in ($itemNames | Select-Object -Unique)) {
+        Initialize-1PasswordItem -ItemTitle $iName -Vault ${1PasswordVault} | Out-Null
+    }
+
 } else {
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        Write-Warn ".NET SDK not found in PATH — User Secrets skipped"
-        $SkipUserSecrets = $true
+    Write-Banner "[2/8] Initialize User Secrets"
+    if ($SkipUserSecrets) {
+        Write-Skip "Skipped (--SkipUserSecrets)"
     } else {
-        foreach ($proj in $startupProjects) {
-            if (Initialize-UserSecrets -Proj $proj) { $readyProjects += $proj }
+        if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            Write-Warn ".NET SDK not found in PATH — User Secrets skipped"
+            $SkipUserSecrets = $true
+        } else {
+            foreach ($proj in $startupProjects) {
+                if (Initialize-UserSecrets -Proj $proj) { $readyProjects += $proj }
+            }
         }
     }
 }
@@ -897,8 +1323,18 @@ if ($jsonFiles.Count -eq 0) {
     Write-Skip "No base JSON config files found"
 } else {
     foreach ($f in $jsonFiles) {
-        Invoke-ProcessJsonConfig -Path $f.FullName -Projects $readyProjects
+        $itemName = if ($Use1Password) {
+            Get-1PasswordItemName -ConfigPath $f.FullName -Root $root -Projects $startupProjects -Prefix ${1PasswordPrefix}
+        } else { '' }
+        Invoke-ProcessJsonConfig -Path $f.FullName -Projects $readyProjects -ItemName $itemName
     }
+}
+
+# ── 3b. Write .env.op files and inject code (1Password mode only) ─────────────
+if ($Use1Password) {
+    Write-Banner "[3b/8] Generate .env.op Files & Code Integration"
+    Write-DotEnvOpFiles -Root $root -Projects $startupProjects -Prefix ${1PasswordPrefix}
+    Add-1PasswordCodeIntegration -Projects $startupProjects -Root $root
 }
 
 # ── 4. Check XML config files ─────────────────────────────────────────────────
@@ -1022,6 +1458,14 @@ if ($trackedSensitive.Count -gt 0 -and -not $UntrackSensitiveFiles) {
     Write-Warn "Sensitive files still tracked by git — run with -UntrackSensitiveFiles or:"
     $rmCommands | ForEach-Object { Write-Warn "  $_" }
     Write-Info "  Then commit: git commit -m 'chore: untrack committed secrets'"
+}
+
+if ($Use1Password) {
+    Write-OK "1Password items populated (vault: ${1PasswordVault}, prefix: ${1PasswordPrefix})"
+    Write-Info "  Items  : ${1PasswordPrefix}-solution + one per startup project"
+    Write-Info "  Run with: op run --env-file .env.op -- dotnet run"
+    Write-Info "  Or:       op run --env-file .env.op -- dotnet watch"
+    Write-Info "  OpSecretsLoader.cs generated per project — call builder.AddOpSecrets() in Program.cs"
 }
 
 Write-Host ''
