@@ -1,0 +1,72 @@
+<Project>
+
+  <!--
+    Central Package Management. Adopt in Phase 1, before any version moves.
+
+    Why it matters for this upgrade specifically:
+      - .NET 10 turns versionless <PackageReference> into ERROR NU1015,
+        except under CPM, where it is the correct form.
+      - CentralPackageTransitivePinningEnabled is the lever that forces a
+        patched transitive version - pairs with .NET 10's transitive audit.
+      - All Microsoft.EntityFrameworkCore.* packages must move in lockstep;
+        one property makes drift impossible.
+
+    Only the NEAREST Directory.Packages.props is evaluated. Nested files must
+    import the parent explicitly.
+
+    All versions below are PLACEHOLDERS. Verify every one against nuget.org
+    at upgrade time - patch levels move monthly.
+  -->
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <!-- <CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled> -->
+
+    <!-- Single source of truth for the lockstep families -->
+    <AspNetCoreVersion>10.0.0</AspNetCoreVersion>
+    <ExtensionsVersion>10.0.0</ExtensionsVersion>
+    <EFCoreVersion>10.0.0</EFCoreVersion>
+    <FunctionsWorkerVersion>2.52.0</FunctionsWorkerVersion>
+  </PropertyGroup>
+
+  <ItemGroup Label="ASP.NET Core">
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="$(AspNetCoreVersion)" />
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="$(AspNetCoreVersion)" />
+    <PackageVersion Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" Version="$(AspNetCoreVersion)" />
+  </ItemGroup>
+
+  <ItemGroup Label="Extensions">
+    <PackageVersion Include="Microsoft.Extensions.Caching.Hybrid" Version="$(ExtensionsVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="$(ExtensionsVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.ServiceDiscovery" Version="$(ExtensionsVersion)" />
+    <PackageVersion Include="Microsoft.Extensions.Validation" Version="$(ExtensionsVersion)" />
+  </ItemGroup>
+
+  <ItemGroup Label="EF Core - must all match">
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="$(EFCoreVersion)" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="$(EFCoreVersion)" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="$(EFCoreVersion)" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="$(EFCoreVersion)" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Tools" Version="$(EFCoreVersion)" />
+    <!-- Third-party providers: MAJOR version must equal the EF Core major version.
+         Npgsql 10.x is GA. Pomelo MySQL has NO EF Core 10 release - verify before use. -->
+  </ItemGroup>
+
+  <ItemGroup Label="Azure Functions (isolated worker)">
+    <PackageVersion Include="Microsoft.Azure.Functions.Worker" Version="$(FunctionsWorkerVersion)" />
+    <PackageVersion Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.1.0" />
+    <PackageVersion Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.1.1" />
+  </ItemGroup>
+
+  <ItemGroup Label="Testing">
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <PackageVersion Include="xunit.v3" Version="4.0.0" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+  <ItemGroup Label="Applies to every project">
+    <!-- <GlobalPackageReference Include="Nerdbank.GitVersioning" Version="3.7.115" PrivateAssets="All" /> -->
+  </ItemGroup>
+
+</Project>

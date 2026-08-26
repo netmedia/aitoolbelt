@@ -1,0 +1,9 @@
+{
+  "//": "Phase 1. Pin the SDK before anything else so every developer and CI agent surfaces the same SDK-level breaks. Verify the current 10.0.1xx feature band on https://dotnet.microsoft.com/download/dotnet/10.0 before committing. Note: dnx scripts bypass global.json SDK selection.",
+  "sdk": {
+    "version": "10.0.100",
+    "rollForward": "latestFeature"
+  },
+  "//test": "Do NOT add a 'test' section during the upgrade. Enabling Microsoft.Testing.Platform is all-or-nothing per solution and breaks 'dotnet test <path>' in CI. See references/07-libraries-and-tests.md.",
+  "//msbuild-sdks": { "MSTest.Sdk": "4.1.0" }
+}

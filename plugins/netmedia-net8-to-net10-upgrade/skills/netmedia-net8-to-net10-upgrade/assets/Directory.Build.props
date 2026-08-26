@@ -1,0 +1,66 @@
+<Project>
+
+  <!--
+    Baseline for a .NET 8 -> .NET 10 upgrade.
+
+    Phase 1: copy this to the repo root while everything is still net8.0.
+    AnalysisLevel and LangVersion are DELIBERATELY pinned low here so the
+    analyzer wave and the C# 14 overload-resolution changes stay out of the
+    retarget commit. Raise them in Phase 5, each as its own commit.
+
+    Case-sensitive on Linux: the file must be named Directory.Build.props.
+    MSBuild stops at the FIRST match walking upward - a nested copy must
+    import its parent explicitly (see references/01-solution-hygiene.md).
+  -->
+
+  <PropertyGroup>
+    <!-- Phase 3: flip to net10.0 -->
+    <TargetFramework>net8.0</TargetFramework>
+
+    <!-- Phase 5.2: raise to latest -->
+    <LangVersion>12</LangVersion>
+
+    <!-- Phase 5: raise to latest-recommended -->
+    <AnalysisLevel>8.0</AnalysisLevel>
+
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Legacy codebases: start at 'warnings', then 'annotations', then 'enable'.
+         See references/07-libraries-and-tests.md. -->
+    <Nullable>warnings</Nullable>
+
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+
+    <!-- false by default on the CLI; turning it on is usually the biggest
+         single source of new warnings. Stage it separately. -->
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <!-- Turn on once the upgrade is green, not before. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <CodeAnalysisTreatWarningsAsErrors>false</CodeAnalysisTreatWarningsAsErrors>
+
+    <!-- .NET 10 flips the default to 'all' for net10.0+. Setting it explicitly
+         means the behaviour does not change under you at retarget time. -->
+    <NuGetAuditMode>direct</NuGetAuditMode>
+    <NuGetAuditLevel>moderate</NuGetAuditLevel>
+
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(TF_BUILD)' == 'true' or '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!--
+    Phase 5 target state - swap the block above for this one:
+
+    <PropertyGroup>
+      <TargetFramework>net10.0</TargetFramework>
+      <LangVersion>latest</LangVersion>
+      <AnalysisLevel>latest-recommended</AnalysisLevel>
+      <Nullable>enable</Nullable>
+      <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+      <NuGetAuditMode>all</NuGetAuditMode>
+    </PropertyGroup>
+  -->
+
+</Project>

@@ -18,6 +18,28 @@
       },
       "source": "./plugins/efcore-gdpr-obfuscate",
       "category": "development"
+    },
+    {
+      "name": "efcore-squash-migrations",
+      "description": "Squashes an entire EF Core migration history into a single migration and wires up safe startup logic so new databases get the full schema while existing (already-migrated) databases are marked up-to-date without re-running DDL or losing data.",
+      "author": {
+        "name": "Netmedia",
+        "email": "netmedia@netmedia.hr",
+        "homepage": "https://netmedia.agency"
+      },
+      "source": "./plugins/efcore-squash-migrations",
+      "category": "development"
+    },
+    {
+      "name": "netmedia-net8-to-net10-upgrade",
+      "description": "Upgrades and modernizes a .NET 8 solution to .NET 10 LTS through six gated phases - class libraries, ASP.NET Core Web APIs, MVC/Razor/Blazor websites, Azure Functions and EF Core - then rewrites the code to current .NET 10 idioms (WebApplication hosting, built-in OpenAPI, MapStaticAssets, HybridCache, isolated-worker Functions, EF Core 10 mappings, C# 14, .slnx, Central Package Management). Includes a solution scanner that reports every known upgrade blocker before any code is touched.",
+      "author": {
+        "name": "Netmedia",
+        "email": "netmedia@netmedia.hr",
+        "homepage": "https://netmedia.agency"
+      },
+      "source": "./plugins/netmedia-net8-to-net10-upgrade",
+      "category": "development"
     }
   ]
 }
