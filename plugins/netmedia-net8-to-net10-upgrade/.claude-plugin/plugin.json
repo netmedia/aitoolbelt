@@ -1,0 +1,13 @@
+{
+  "name": "netmedia-net8-to-net10-upgrade",
+  "version": "1.0.0",
+  "description": "Upgrades and modernizes a .NET 8 solution to .NET 10 LTS through six gated phases - class libraries, ASP.NET Core Web APIs, MVC/Razor/Blazor websites, Azure Functions and EF Core - then rewrites the code to current .NET 10 idioms. Includes a solution scanner that reports every known upgrade blocker before any code is touched.",
+  "author": {
+    "name": "Netmedia",
+    "email": "netmedia@netmedia.hr",
+    "url": "https://netmedia.agency"
+  },
+  "homepage": "https://netmedia.agency",
+  "license": "MIT",
+  "keywords": ["dotnet", "net10", "upgrade", "migration", "aspnetcore", "efcore", "azure-functions", "csharp"]
+}

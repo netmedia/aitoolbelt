@@ -288,6 +288,28 @@ EF 9: table and projection pruning, inlined uncorrelated subqueries (2 roundtrip
 
 Requires SQL Server 2025+ / Azure SQL. **Exact search only** in EF 10 — `SqlVector<float>` + `EF.Functions.VectorDistance`. Approximate search with a vector index (`HasVectorIndex`, `VectorSearch()`) is **EF Core 11**, as is SQL Server full-text search and `.config/dotnet-ef.json`. If you already use the community `EFCore.SqlServer.VectorSearch` package, remove it.
 
+## Optional de-risking: take EF Core 9 first, on `net8.0`
+
+**EF Core 9 targets .NET 8.** This is the one place in the whole upgrade where a genuine intermediate stop exists — you can absorb EF 9's behavioural breaks *without* a TFM change, ship that, and only then move to `net10.0` + EF 10.
+
+Worth doing when the codebase has any of: `Migrate()` called at startup, LINQ over nullable columns, Cosmos DB, or compiled queries. Skip it for a small model with a clean migration story.
+
+**Stage A — EF 9 on `net8.0`** (no TFM change, no C# change, no SDK dependency)
+
+1. Bump `Microsoft.EntityFrameworkCore.*` to `9.0.x`; add `<Publish>true</Publish>` to the `.Design` reference.
+2. Remove any external transaction / `ExecutionStrategy` wrapper around `Migrate()`.
+3. Run `has-pending-model-changes`; fix drift.
+4. Audit `!(a op b)` over nullable columns and `.ToString()` on nullables.
+5. Remove `EF.Constant`/`EF.Parameter` from `EF.CompileQuery` bodies.
+6. Cosmos: decide `$type` / `id` / shadow-id, convert sync calls to async.
+7. Note that `UseSqlServer`'s default compat level dropped 160 → 150; add `UseCompatibilityLevel(160)` if you want `LEAST`/`GREATEST`.
+
+Ship and observe. Everything above is a *runtime behaviour* change, and isolating it means a production incident points at EF rather than at the whole platform bump.
+
+**Stage B — `net10.0` + EF 10.** The rest of this document.
+
+> This does **not** generalize to the runtime. There is no useful `net9.0` stop: .NET 9 leaves support the same day as .NET 8, so retargeting to it buys nothing and costs a second full regression pass. Stage the *upgrade axes* instead (SDK → TFM → language → analyzers), which is what `SKILL.md` Phases 2–5 do.
+
 ## Checklist
 
 1. Remove any external transaction / `ExecutionStrategy` wrapper around `Migrate()`.

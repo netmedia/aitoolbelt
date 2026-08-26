@@ -50,7 +50,7 @@ Never mix the two in one commit. The upgrade must be reviewable on its own.
 
 Consequences to state to the user up front if they don't already know:
 
-- Do **not** stop at `net9.0`. It expires the same day as `net8.0`.
+- Do **not** retarget to `net9.0` as a stepping stone. It expires the same day as `net8.0`, so it buys nothing and costs a second full regression pass. Stage the *upgrade axes* instead — SDK, then TFM, then language, then analyzers (Phases 2–5). The one real exception is EF Core 9, which targets .NET 8; see Phase 3.
 - If any Functions project is still in-process, that migration is a **hard prerequisite**, not cleanup.
 - `dotnet upgrade-assistant` is deprecated. There is no supported deterministic migrator. The sequence in this skill is the replacement.
 
@@ -60,11 +60,13 @@ Work through the phases in order. Each phase ends with a **gate**: `dotnet build
 
 ### Phase 0 — Inventory
 
-Run the scanner before reading anything else:
+Run the scanner before reading anything else, from the solution root. Use its **absolute path** — the working directory is the user's repo, not the skill folder:
 
 ```bash
-python3 scripts/inventory.py /path/to/solution --out UPGRADE-PLAN.md --json inventory.json
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/netmedia-net8-to-net10-upgrade/scripts/inventory.py . --out UPGRADE-PLAN.md --json inventory.json
 ```
+
+On Windows the interpreter is usually `python`; elsewhere `python3`. Stdlib only, no dependencies, read-only — it never writes into the scanned tree. If neither interpreter is present, fall back to reading the `.csproj` files directly and working the reference checklists by hand.
 
 It classifies every project (library / web / functions / test / worker), extracts TFMs and package versions, and greps for the ~40 known upgrade landmines. Read `UPGRADE-PLAN.md`, then read only the reference files the findings point at.
 
