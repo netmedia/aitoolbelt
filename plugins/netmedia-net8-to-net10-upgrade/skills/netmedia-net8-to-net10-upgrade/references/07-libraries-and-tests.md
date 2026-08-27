@@ -52,6 +52,22 @@ Generated code is auto-excluded when `.editorconfig` sets `generated_code = true
 
 **.NET 10 raises the stakes:** `JsonSerializerOptions.Strict` and `RespectNullableAnnotations = true` make nullable annotations **load-bearing at runtime** for System.Text.Json. Getting them right is no longer cosmetic.
 
+**If any project in the flip has EF Core entities, `enable` is also load-bearing for the database model — verify before shipping, not after.** EF Core's default conventions read C# nullable-reference-type annotations to decide whether a mapped property is `Required`. Every `string`/reference-type property that lacks `?` and lacks an explicit `.IsRequired(false)`/`[Required(false)]` override silently becomes "Required" in the EF model the moment `Nullable` flips to `enable` — regardless of what the real database column allows. On a legacy codebase where nullability was never audited, this is not a rare edge case; expect **dozens of properties** to flip at once, one per un-annotated reference-type column.
+
+The failure mode is silent and comes in two shapes, worse than a compiler warning:
+- If any of the affected entities use `HasData(...)` (seed data) and the seed omits a value for one of these now-"required" properties, `dotnet ef migrations add`/`has-pending-model-changes`/first-run model validation **throws outright** — not a warning, a hard crash, and it can happen at application startup (model building happens on first `DbContext` use), not just in design-time tooling.
+- If a migration is generated against this drifted model without noticing, EF Core scaffolds `ALTER COLUMN ... NOT NULL DEFAULT ''`-style statements for every affected column — a **data-loss migration** that silently coerces every existing `NULL` in that column to an empty string if it's ever run against a real database with existing NULLs. This is a `dotnet ef migrations add` "may result in the loss of data" warning that is easy to skim past.
+
+Do not skip this check because the earlier compile-and-warn gate passed — nullable warnings and EF model validity are two independent surfaces that both changed at once.
+
+**Mandatory check immediately after any `enable` flip on a project with EF Core entities:**
+1. `dotnet ef migrations has-pending-model-changes --project <p> --startup-project <sp>`. Clean output means no drift. A crash (not just "pending changes") means at least one seeded entity hit the required-property wall — fix that first before the check can even run cleanly.
+2. Once it reports cleanly as "pending", run `dotnet ef migrations add ProbeNullableModelDrift --project <p> --startup-project <sp>` to see the actual scaffolded diff. **Read the `Up()` method.** If it contains `AlterColumn` calls flipping `nullable: true` → `nullable: false` with a `defaultValue`, that is the data-loss migration — do not apply it.
+3. `dotnet ef migrations remove` to discard the probe migration.
+4. For every property the probe surfaced, decide per-property against the actual DB reality (check the existing model snapshot / a `SELECT COUNT(*) WHERE column IS NULL` if a database is reachable): if the column has always been nullable and/or genuinely optional data, annotate the C# property `?` to match — this is a pure C#-side fix with zero SQL impact. Only use `.IsRequired()`/`[Required]` deliberately, for properties that should genuinely reject `NULL` going forward (that *is* a real schema change and needs its own reviewed migration, not a side effect of a language-level nullable flip).
+5. Re-run step 1 to confirm clean, with no new migration file.
+6. This applies to shared/base entity classes too (e.g. a generic lookup-table base class used by multiple derived entities) — one un-annotated property on a shared base can silently affect every table that uses it.
+
 ## ImplicitUsings, InternalsVisibleTo, AssemblyInfo
 
 `<ImplicitUsings>enable</ImplicitUsings>` injects `System`, `System.Collections.Generic`, `System.IO`, `System.Linq`, `System.Net.Http`, `System.Threading`, `System.Threading.Tasks` and more. **Ambiguity risk on a legacy codebase:** a local type named `Task`, `Path`, or `File` now collides.

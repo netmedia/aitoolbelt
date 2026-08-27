@@ -149,7 +149,7 @@ Only now unpin `LangVersion` and raise `AnalysisLevel`. Land each of these as it
 6. `AddValidation()`, `IExceptionHandler` + ProblemDetails, HybridCache — `references/04-aspnetcore.md`
 7. Source generators: `[LoggerMessage]`, `[GeneratedRegex]`, STJ source generation — `references/07-libraries-and-tests.md`
 8. EF Core: complex types, named query filters, `ExecuteUpdateAsync`, compiled models — `references/05-efcore.md`
-9. Nullable reference types, phased `warnings` → `annotations` → `enable` — `references/07-libraries-and-tests.md`
+9. Nullable reference types, phased `warnings` → `annotations` → `enable` — `references/07-libraries-and-tests.md`. **If the project has EF Core entities, flipping to `enable` is not just a warnings change — it silently changes which properties EF Core's model considers `Required`.** Run the EF-model-drift check in that reference file's "Nullable reference types on a legacy codebase" section immediately after the flip, before moving on. Skipping this can produce a migration that coerces existing `NULL` data to empty strings the next time someone runs `dotnet ef migrations add` without noticing the drift
 
 **Apply vs. propose.** Apply anything mechanical and locally verifiable. *Propose* — as a diff in the report, not as an edit — anything that changes a public API surface, a database schema, a serialized wire format, or a deployment topology. Specifically propose rather than apply:
 
@@ -176,7 +176,7 @@ Numbered so the user can say "tackle #3" in a future session and you can jump st
 - full test suite
 - `dotnet format --verify-no-changes`
 - `dotnet package list --vulnerable --include-transitive`
-- EF: `dotnet ef migrations has-pending-model-changes`, plus a diff of `migrations script 0 --idempotent` before vs after
+- EF: `dotnet ef migrations has-pending-model-changes`, plus a diff of `migrations script 0 --idempotent` before vs after. **If Phase 5 flipped `Nullable` to `enable` on any EF Core project, this is not redundant with Phase 3d's check** — Phase 3d ran before the nullable flip, so it cannot have caught the model drift that flip introduces. Treat a crash (not just "pending changes") here as expected-until-proven-otherwise on a legacy codebase; see `references/07-libraries-and-tests.md`'s EF-model-drift check
 - benchmark GC shape and a representative hot path (DATAS, memory-pool eviction, and the EF parameter-mode change all move numbers)
 - verify behind the *real* reverse proxy / IIS, not just Kestrel locally
 - re-check observability: handled-exception diagnostics, W3C trace propagation, EF SQL parameter names in log queries
