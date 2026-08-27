@@ -58,6 +58,15 @@ Consequences to state to the user up front if they don't already know:
 
 Work through the phases in order. Each phase ends with a **gate**: `dotnet build` clean and tests green. Do not start a phase before the previous gate passes. Commit at every gate.
 
+### Risky changes: commit before/after, and keep a MUST TEST log
+
+Some changes inside a phase are not mechanical — they're a diagnosis ("this is broken, here's the fix") applied without a way to actually run the app and confirm it. That includes anything in Phase 4, most of Phase 5's judgment-based items, and any change you cannot verify beyond "it compiles." For each one:
+
+1. **Before applying it, offer the user a commit checkpoint** if the working tree has uncommitted changes — a clean "before" commit makes the change bisectable and trivially revertible. Don't ask for permission to commit itself if the user has already authorized commits for this session; just do it, and say so.
+2. **Land the risky change as its own commit**, separate from mechanical changes in the same phase, so `git diff <before>..<after>` shows exactly the risky part.
+3. **Record it in a `## MUST TEST after upgrade` section** in `UPGRADE-PLAN.md` (append one row per item, don't wait until the end — add it right after the commit lands, while the reasoning is fresh). Columns: risk description, files touched, before-commit SHA, after-commit SHA, what to test, how to test. This is what makes the difference between "hope it works" and "here's exactly what to click/run to find out."
+4. **Verify your own diagnosis before applying the fix**, not just before shipping it. The single most expensive mistake in this category is fixing a *suspected* breaking change based on the API surface alone (e.g., "this call is obsolete/ignored, so behavior must be broken") without checking how the affected data is *consumed* downstream. Concretely: before changing an auth/claims/serialization default, grep for every place that reads the thing you're about to change the shape of, and confirm your fix's output matches what those readers expect — not just what the framework's default *used to be* or what a migration doc says the "old" behavior was. A change that "fixes" a bug that was never actually happening (because some other default was already compensating) is worse than not fixing it, because it ships with a clean build and a compelling-sounding commit message. If you find you were wrong after already committing the fix, revert immediately, as its own commit, and record the incident in the MUST TEST log the same way (before/after refs spanning the bad window) — don't silently amend history.
+
 ### Phase 0 — Inventory
 
 Run the scanner before reading anything else, from the solution root. Use its **absolute path** — the working directory is the user's repo, not the skill folder:
@@ -151,6 +160,16 @@ Only now unpin `LangVersion` and raise `AnalysisLevel`. Land each of these as it
 - hosting-plan migrations (Linux Consumption → Flex Consumption)
 - Microsoft.Testing.Platform adoption (all-or-nothing per solution, breaks CI invocations)
 
+**Every proposed-not-applied item is a numbered, self-contained backlog entry, not a one-line note.** The upgrade session ends; a *different* session, possibly weeks later with zero memory of this conversation, is what actually executes these. Write each one so that session can act on just the entry — treat it like handing the task to a new hire who has the repo but not your context. For each item in `UPGRADE-PLAN.md`'s `## Follow-up backlog` section, include:
+
+1. **Origin and status** — which phase surfaced it, and why it wasn't applied now (scope larger than expected, needs a design decision, no current usage to convert, etc.) — the *reason*, not just "deferred."
+2. **Every current call site**, as a table or list: exact file path, line number(s), and a one-line description of what's there. Get this from a fresh grep at write-time, not from memory of what you saw earlier in the session — code shifts line numbers as you edit.
+3. **The actual blocker**, explained concretely enough that someone unfamiliar with the investigation understands *why* this isn't a five-minute mechanical change — an API shape mismatch, a downstream contract risk, a hazard specific to this codebase's architecture (name the exact class/method that creates the hazard).
+4. **A concrete step-by-step execution plan** — not "consider doing X" but an ordered list a fresh session can follow: what to add, what to touch first (and why that one first — usually lowest-risk or highest-value), what to check before proceeding to the next file, where the genuinely hard decision point is (and what the options are, if it's a design choice rather than a mechanical one).
+5. **A verification section** — what to run or exercise afterward to confirm it worked, specific to this item (not a generic "run the tests").
+
+Numbered so the user can say "tackle #3" in a future session and you can jump straight to it. Do not compress this into a single paragraph per item — under-detailing here just relocates the investigation work you already did back onto a future session that has to redo it from scratch.
+
 ### Phase 6 — Verify
 
 - `dotnet build -warnaserror`
@@ -162,7 +181,7 @@ Only now unpin `LangVersion` and raise `AnalysisLevel`. Land each of these as it
 - verify behind the *real* reverse proxy / IIS, not just Kestrel locally
 - re-check observability: handled-exception diagnostics, W3C trace propagation, EF SQL parameter names in log queries
 
-Report what changed, what was proposed and not applied, and every residual warning suppression with an owner.
+Report what changed, what was proposed and not applied, and every residual warning suppression with an owner. Make sure `UPGRADE-PLAN.md`'s `## MUST TEST after upgrade` section (see Workflow above) is complete and current — every risky change from every phase, each with its before/after commit pair, what to test, and how. Make sure `## Follow-up backlog` (see Phase 5's "Apply vs. propose" above) has one fully-detailed, numbered entry per proposed-not-applied item across the whole upgrade, not just Phase 5's. These two sections are the actual handoff artifact when there's no environment in which to run the app yourself, or when the user starts a fresh session later to work the backlog one item at a time — treat both as required output, not optional documentation.
 
 ## Blockers to surface immediately
 
