@@ -288,6 +288,16 @@ EF 9: table and projection pruning, inlined uncorrelated subqueries (2 roundtrip
 
 Requires SQL Server 2025+ / Azure SQL. **Exact search only** in EF 10 — `SqlVector<float>` + `EF.Functions.VectorDistance`. Approximate search with a vector index (`HasVectorIndex`, `VectorSearch()`) is **EF Core 11**, as is SQL Server full-text search and `.config/dotnet-ef.json`. If you already use the community `EFCore.SqlServer.VectorSearch` package, remove it.
 
+### Cartesian-explosion detection (`MultipleCollectionIncludeWarning`)
+
+Ask during Modernization: **is `RelationalEventId.MultipleCollectionIncludeWarning` configured at all?** By default EF Core only surfaces this as a log-level event, easy to miss unless someone is watching `Microsoft.EntityFrameworkCore` category logs closely. Making it explicit costs nothing and documents the decision instead of relying on framework defaults a future reader won't know are in effect:
+
+```csharp
+options.ConfigureWarnings(w => w.Log(RelationalEventId.MultipleCollectionIncludeWarning));
+```
+
+**Log, don't `Throw`, unless you can prove it's safe.** Escalating to `w.Throw(...)` turns any query with multiple collection `Include()`s into a runtime exception the moment it executes — on a legacy codebase, that means auditing every multi-collection-`Include` query first, or you risk breaking a currently-working (if inefficient) feature on deploy. `Throw` is only safe to reach for in Development if there's a reliable way to gate it by environment at the point the `DbContext` is configured; if that registration is in a shared installer with no `IEnvironment`/`IWebHostEnvironment` available, don't thread one through just for this — `Log` solution-wide is the safer default. If EF Core OpenTelemetry instrumentation is also being adopted in this pass, mention that the warning becomes a structured trace event once both land together, not just local console noise.
+
 ## Optional de-risking: take EF Core 9 first, on `net8.0`
 
 **EF Core 9 targets .NET 8.** This is the one place in the whole upgrade where a genuine intermediate stop exists — you can absorb EF 9's behavioural breaks *without* a TFM change, ship that, and only then move to `net10.0` + EF 10.

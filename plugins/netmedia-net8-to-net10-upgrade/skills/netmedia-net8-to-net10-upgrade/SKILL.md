@@ -58,6 +58,15 @@ Consequences to state to the user up front if they don't already know:
 
 Work through the phases in order. Each phase ends with a **gate**: `dotnet build` clean and tests green. Do not start a phase before the previous gate passes. Commit at every gate.
 
+### Risky changes: commit before/after, and keep a MUST TEST log
+
+Some changes inside a phase are not mechanical — they're a diagnosis ("this is broken, here's the fix") applied without a way to actually run the app and confirm it. That includes anything in Phase 4, most of Phase 5's judgment-based items, and any change you cannot verify beyond "it compiles." For each one:
+
+1. **Before applying it, offer the user a commit checkpoint** if the working tree has uncommitted changes — a clean "before" commit makes the change bisectable and trivially revertible. Don't ask for permission to commit itself if the user has already authorized commits for this session; just do it, and say so.
+2. **Land the risky change as its own commit**, separate from mechanical changes in the same phase, so `git diff <before>..<after>` shows exactly the risky part.
+3. **Record it in a `## MUST TEST after upgrade` section** in `UPGRADE-PLAN.md` (append one row per item, don't wait until the end — add it right after the commit lands, while the reasoning is fresh). Columns: risk description, files touched, before-commit SHA, after-commit SHA, what to test, how to test. This is what makes the difference between "hope it works" and "here's exactly what to click/run to find out."
+4. **Verify your own diagnosis before applying the fix**, not just before shipping it. The single most expensive mistake in this category is fixing a *suspected* breaking change based on the API surface alone (e.g., "this call is obsolete/ignored, so behavior must be broken") without checking how the affected data is *consumed* downstream. Concretely: before changing an auth/claims/serialization default, grep for every place that reads the thing you're about to change the shape of, and confirm your fix's output matches what those readers expect — not just what the framework's default *used to be* or what a migration doc says the "old" behavior was. A change that "fixes" a bug that was never actually happening (because some other default was already compensating) is worse than not fixing it, because it ships with a clean build and a compelling-sounding commit message. If you find you were wrong after already committing the fix, revert immediately, as its own commit, and record the incident in the MUST TEST log the same way (before/after refs spanning the bad window) — don't silently amend history.
+
 ### Phase 0 — Inventory
 
 Run the scanner before reading anything else, from the solution root. Use its **absolute path** — the working directory is the user's repo, not the skill folder:
@@ -137,10 +146,11 @@ Only now unpin `LangVersion` and raise `AnalysisLevel`. Land each of these as it
 3. Hosting: `Startup.cs` → `WebApplication` builder, endpoint/service extension methods — `references/04-aspnetcore.md` § 2
 4. `UseStaticFiles` → `MapStaticAssets`, `TypedResults`, route groups — `references/04-aspnetcore.md` § 1
 5. Swashbuckle → built-in OpenAPI + Scalar — `references/04-aspnetcore.md` § 1.1
-6. `AddValidation()`, `IExceptionHandler` + ProblemDetails, HybridCache — `references/04-aspnetcore.md`
+6. `AddValidation()`, `IExceptionHandler` + ProblemDetails, HybridCache — `references/04-aspnetcore.md`. **Also check every project for the classic `Microsoft.ApplicationInsights.*` SDK** (including ones pulled in transitively via a shared library) and ask whether to migrate to the Azure Monitor OpenTelemetry Exporter — `references/04-aspnetcore.md` § 1.11 has the pattern, the exact `using` list that's easy to get wrong, and the gotchas found migrating a real Azure Functions isolated-worker project (missing central package versions on half-finished migrations, logging needing a separate opt-in, host/worker telemetry duplication without the Functions-specific glue package)
 7. Source generators: `[LoggerMessage]`, `[GeneratedRegex]`, STJ source generation — `references/07-libraries-and-tests.md`
-8. EF Core: complex types, named query filters, `ExecuteUpdateAsync`, compiled models — `references/05-efcore.md`
-9. Nullable reference types, phased `warnings` → `annotations` → `enable` — `references/07-libraries-and-tests.md`
+8. EF Core: complex types, named query filters, `ExecuteUpdateAsync`, compiled models, cartesian-explosion (`MultipleCollectionIncludeWarning`) detection — `references/05-efcore.md`
+9. Nullable reference types, phased `warnings` → `annotations` → `enable` — `references/07-libraries-and-tests.md`. **If the project has EF Core entities, flipping to `enable` is not just a warnings change — it silently changes which properties EF Core's model considers `Required`.** Run the EF-model-drift check in that reference file's "Nullable reference types on a legacy codebase" section immediately after the flip, before moving on. Skipping this can produce a migration that coerces existing `NULL` data to empty strings the next time someone runs `dotnet ef migrations add` without noticing the drift
+10. Operational hardening: rate limiting, output caching, health checks — `references/04-aspnetcore.md` §§ 1.12–1.14. All three are usually **entirely absent** on a legacy codebase (check with `grep` before assuming), and all three are safe, additive, zero-package-cost adoptions **except output caching, which needs a real per-endpoint safety audit** — never apply it to anything time-sensitive or transactional (a booking/availability-check endpoint cached even briefly can cause real double-booking bugs). Also register `TimeProvider` in DI (`references/07-libraries-and-tests.md`) as a zero-risk, purely-additive step — but do not bulk-convert existing `DateTime.UtcNow`/`.Now` call sites in the same pass; that's a separate, individually-risky follow-up that needs real test coverage per file, not a find-replace
 
 **Apply vs. propose.** Apply anything mechanical and locally verifiable. *Propose* — as a diff in the report, not as an edit — anything that changes a public API surface, a database schema, a serialized wire format, or a deployment topology. Specifically propose rather than apply:
 
@@ -151,18 +161,28 @@ Only now unpin `LangVersion` and raise `AnalysisLevel`. Land each of these as it
 - hosting-plan migrations (Linux Consumption → Flex Consumption)
 - Microsoft.Testing.Platform adoption (all-or-nothing per solution, breaks CI invocations)
 
+**Every proposed-not-applied item is a numbered, self-contained backlog entry, not a one-line note.** The upgrade session ends; a *different* session, possibly weeks later with zero memory of this conversation, is what actually executes these. Write each one so that session can act on just the entry — treat it like handing the task to a new hire who has the repo but not your context. For each item in `UPGRADE-PLAN.md`'s `## Follow-up backlog` section, include:
+
+1. **Origin and status** — which phase surfaced it, and why it wasn't applied now (scope larger than expected, needs a design decision, no current usage to convert, etc.) — the *reason*, not just "deferred."
+2. **Every current call site**, as a table or list: exact file path, line number(s), and a one-line description of what's there. Get this from a fresh grep at write-time, not from memory of what you saw earlier in the session — code shifts line numbers as you edit.
+3. **The actual blocker**, explained concretely enough that someone unfamiliar with the investigation understands *why* this isn't a five-minute mechanical change — an API shape mismatch, a downstream contract risk, a hazard specific to this codebase's architecture (name the exact class/method that creates the hazard).
+4. **A concrete step-by-step execution plan** — not "consider doing X" but an ordered list a fresh session can follow: what to add, what to touch first (and why that one first — usually lowest-risk or highest-value), what to check before proceeding to the next file, where the genuinely hard decision point is (and what the options are, if it's a design choice rather than a mechanical one).
+5. **A verification section** — what to run or exercise afterward to confirm it worked, specific to this item (not a generic "run the tests").
+
+Numbered so the user can say "tackle #3" in a future session and you can jump straight to it. Do not compress this into a single paragraph per item — under-detailing here just relocates the investigation work you already did back onto a future session that has to redo it from scratch.
+
 ### Phase 6 — Verify
 
 - `dotnet build -warnaserror`
 - full test suite
 - `dotnet format --verify-no-changes`
 - `dotnet package list --vulnerable --include-transitive`
-- EF: `dotnet ef migrations has-pending-model-changes`, plus a diff of `migrations script 0 --idempotent` before vs after
+- EF: `dotnet ef migrations has-pending-model-changes`, plus a diff of `migrations script 0 --idempotent` before vs after. **If Phase 5 flipped `Nullable` to `enable` on any EF Core project, this is not redundant with Phase 3d's check** — Phase 3d ran before the nullable flip, so it cannot have caught the model drift that flip introduces. Treat a crash (not just "pending changes") here as expected-until-proven-otherwise on a legacy codebase; see `references/07-libraries-and-tests.md`'s EF-model-drift check
 - benchmark GC shape and a representative hot path (DATAS, memory-pool eviction, and the EF parameter-mode change all move numbers)
 - verify behind the *real* reverse proxy / IIS, not just Kestrel locally
 - re-check observability: handled-exception diagnostics, W3C trace propagation, EF SQL parameter names in log queries
 
-Report what changed, what was proposed and not applied, and every residual warning suppression with an owner.
+Report what changed, what was proposed and not applied, and every residual warning suppression with an owner. Make sure `UPGRADE-PLAN.md`'s `## MUST TEST after upgrade` section (see Workflow above) is complete and current — every risky change from every phase, each with its before/after commit pair, what to test, and how. Make sure `## Follow-up backlog` (see Phase 5's "Apply vs. propose" above) has one fully-detailed, numbered entry per proposed-not-applied item across the whole upgrade, not just Phase 5's. These two sections are the actual handoff artifact when there's no environment in which to run the app yourself, or when the user starts a fresh session later to work the backlog one item at a time — treat both as required output, not optional documentation.
 
 ## Blockers to surface immediately
 
