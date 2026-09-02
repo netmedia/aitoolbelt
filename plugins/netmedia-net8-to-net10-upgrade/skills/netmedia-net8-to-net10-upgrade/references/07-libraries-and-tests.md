@@ -1,6 +1,6 @@
 # Class libraries and test projects
 
-Contents: [Multi-targeting](#multi-targeting) · [Nullable rollout](#nullable-reference-types-on-a-legacy-codebase) · [ImplicitUsings & AssemblyInfo](#implicitusings-internalsvisibleto-assemblyinfo) · [Source generators](#source-generators) · [Trim/AOT](#trimming--aot-readiness) · [Test projects](#test-projects)
+Contents: [Multi-targeting](#multi-targeting) · [Nullable rollout](#nullable-reference-types-on-a-legacy-codebase) · [ImplicitUsings & AssemblyInfo](#implicitusings-internalsvisibleto-assemblyinfo) · [Source generators](#source-generators) · [Trim/AOT](#trimming--aot-readiness) · [TimeProvider](#timeprovider-for-testable-time-dependent-code) · [Test projects](#test-projects)
 
 ## Multi-targeting
 
@@ -156,6 +156,26 @@ public static object Create([DynamicallyAccessedMembers(DynamicallyAccessedMembe
 .NET 10 changes to watch: **HTTP/3 disabled by default under `PublishTrimmed`**; **single-file apps no longer probe the executable directory for native libraries**; trim annotations removed from the `DefaultValueAttribute` ctor and trim-unsafe `Microsoft.Extensions.Configuration` paths (source-breaking if you relied on them).
 
 .NET 9 feature switches make trimming tractable for libraries: `[FeatureSwitchDefinition("Feature.IsSupported")]` on a static bool property plus `<RuntimeHostConfigurationOption Include="Feature.IsSupported" Value="false" Trim="true" />`, and `[FeatureGuard(typeof(RequiresDynamicCodeAttribute))]` to suppress AOT warnings behind a guard.
+
+## `TimeProvider` for testable time-dependent code
+
+Ask during Modernization: **how many direct `DateTime.UtcNow`/`DateTime.Now` call sites exist, and are any of them in code that will ever need a unit test?** `grep -rn "DateTime.UtcNow\|DateTime.Now"` — on a legacy codebase this is often in the dozens, frequently including the audit-trail/timestamp mechanism used by every entity (e.g. a shared `SaveChanges()` override that stamps `CreatedOnDate`/`ModifiedOnDate`).
+
+`TimeProvider` (abstract class, `System` namespace, built in since .NET 8 — no package) is the injectable replacement. Registering it is a **zero-risk, one-line, purely additive** step:
+
+```csharp
+services.AddSingleton(TimeProvider.System);
+```
+
+**Converting existing call sites is a completely different risk tier — do not bundle the two.** Registering `TimeProvider` in DI touches nothing existing and is always safe to do immediately. Actually converting `DateTime.UtcNow` → `_timeProvider.GetUtcNow()` at each call site is a real behavior-preserving refactor that needs verification, and on a codebase with no test coverage for the code being touched, there's no automated way to confirm nothing broke. Don't bulk-convert with find-replace across dozens of files in one pass.
+
+If call-site conversion is in scope, sequence it as its own deliberate follow-up, one file at a time:
+1. Inject `TimeProvider` via constructor.
+2. Replace the call site.
+3. **Write the test first (or immediately after), using `Microsoft.Extensions.Time.Testing`'s `FakeTimeProvider`** to actually assert the conversion changed something observable. A conversion with no accompanying test delivers zero testability benefit — it's just churn that happens to compile.
+4. Gate per file, not batched — a mistake in file 1 shouldn't block or hide inside a 40-file diff.
+
+Flag the highest-value, highest-risk candidates explicitly rather than converting them first: a shared audit-trail/timestamp mechanism used by every entity is exactly the kind of thing worth converting *eventually* for testability, but a mistake there is also the hardest to notice (silently wrong timestamps, not a crash) — sequence it after lower-stakes files have proven the pattern works.
 
 ## Test projects
 

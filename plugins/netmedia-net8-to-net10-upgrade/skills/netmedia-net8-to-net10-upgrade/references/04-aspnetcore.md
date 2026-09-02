@@ -247,7 +247,110 @@ builder.Services.AddHttpClient<CatalogClient>(c => c.BaseAddress = new("https+ht
 
 New telemetry worth wiring to dashboards: .NET 9 — `kestrel.connection.duration` gains `error.type`, SignalR `ActivitySource`s, `.DisableHttpMetrics()` on health checks. .NET 10 — authentication/authorization metrics, the `Microsoft.AspNetCore.Identity` meter, Blazor component/circuit metrics, memory-pool metrics.
 
-### 1.11 Passkeys (.NET 10)
+### 1.11 Migrating off the classic Application Insights SDK
+
+If a project references `Microsoft.ApplicationInsights.*` (`.AspNetCore`, `.WorkerService`, or plain `Microsoft.ApplicationInsights`), ask: **is this project ready to move to the Azure Monitor OpenTelemetry Exporter?** The classic SDK is in maintenance mode; Microsoft's actively-developed path — and, for isolated-worker Azure Functions specifically, the explicitly documented one — is OpenTelemetry via `Azure.Monitor.OpenTelemetry.Exporter`. This is a good Modernization-phase candidate, same tier as `IExceptionHandler`/HybridCache: usually applied per-project, not solution-wide in one commit, since a shared library (e.g. a `netmedia`-style base project) can pull the classic SDK into some projects and not others — check each project's own package references rather than assuming solution-wide uniformity.
+
+**Full migration vs. running both.** Running the classic SDK and OpenTelemetry side by side is not free — both would typically export to the same Application Insights resource, so anything both track (request/dependency telemetry) risks being double-counted. Prefer a full migration per project unless there's a specific reason to stage it (e.g. validating OTel output against a known-good classic-SDK baseline before cutting over). A full migration removes the classic SDK's package references and its `Add*Telemetry*()`/`Configure*ApplicationInsights()` calls entirely, replacing them with the pattern below — not an additive change.
+
+**Minimal working pattern** (ASP.NET Core or Azure Functions isolated worker):
+
+```csharp
+if (!string.IsNullOrEmpty(builder.Configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"]))
+{
+    builder.Logging.AddOpenTelemetry(o =>
+    {
+        o.IncludeFormattedMessage = true;
+        o.IncludeScopes = true;
+    });
+
+    builder.Services.AddOpenTelemetry()
+        // Azure Functions isolated worker only — avoids host/worker telemetry duplication.
+        // Omit for plain ASP.NET Core.
+        .UseFunctionsWorkerDefaults()
+        .WithTracing(t => t
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddEntityFrameworkCoreInstrumentation())
+        .WithMetrics(m => m
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddRuntimeInstrumentation())
+        .UseAzureMonitorExporter();
+}
+```
+
+Requires `using OpenTelemetry;`, `using OpenTelemetry.Trace;`, `using OpenTelemetry.Metrics;`, `using OpenTelemetry.Logs;` — `WithTracing`/`WithMetrics` are extension methods on `IOpenTelemetryBuilder` that live in the root `OpenTelemetry` namespace, easy to miss since the instrumentation calls inside the lambdas (`AddAspNetCoreInstrumentation()` etc.) come from `OpenTelemetry.Trace`/`OpenTelemetry.Metrics` instead — a plausible-looking `using` list that's missing just the root namespace still fails to compile.
+
+Gotchas that come up in a legacy codebase doing this migration for the first time:
+
+- **`builder.Logging.AddOpenTelemetry(...)` is a separate opt-in from `builder.Services.AddOpenTelemetry()`.** The services-level call wires tracing and metrics; it does *not* route `ILogger` output anywhere. Skip the logging-builder call and logs silently stop flowing to Azure Monitor — no error, no warning, just missing log data in production.
+- **For Azure Functions isolated worker, always include `Microsoft.Azure.Functions.Worker.OpenTelemetry`'s `UseFunctionsWorkerDefaults()`.** Isolated-worker Functions run a host process and a worker process; without this call, both can emit overlapping telemetry for the same invocation.
+- **`UseAzureMonitorExporter()` is "cross-cutting"** — one call wires the exporter for traces, metrics, *and* logs together (confirmed in the Azure Monitor Exporter docs; has worked this way since exporter version 1.4.0-beta.3). Don't hunt for a separate logs-specific exporter registration call — the single call is correct as long as the logging opt-in above is also present.
+- **A `PackageReference` added without a matching `Directory.Packages.props` `PackageVersion` entry is a common half-finished-migration smell in a CPM repo.** If you find OpenTelemetry package references already present but the project doesn't build, check for exactly this before assuming a real version-resolution conflict — it's usually someone having added the reference and not yet the central version, not a genuine NuGet conflict.
+- **`OpenTelemetry.Instrumentation.EntityFrameworkCore` has no stable release** — every version ever published to NuGet is a beta (verify against the current version list at implementation time; this has been true for years, not a temporary gap). Using it means accepting a real prerelease dependency in production, not a placeholder that will resolve to stable later without action.
+- **`Live Metrics`, a feature associated with the classic SDK, is preserved** — the Azure Monitor OpenTelemetry Exporter enables it by default. Not a capability lost in the migration.
+
+Not runtime-verifiable without a live `APPLICATIONINSIGHTS_CONNECTION_STRING` and an Azure Monitor resource to inspect — flag actual trace/metric/log delivery as a MUST-TEST item if this lands without that available in the session.
+
+### 1.12 Rate limiting (`Microsoft.AspNetCore.RateLimiting`)
+
+Ask during Modernization: **does any public-facing endpoint have zero rate limiting?** On a legacy codebase the answer is usually yes — check with `grep -rn "AddRateLimiter\|UseRateLimiter"` before assuming. This is built into the ASP.NET Core shared framework since .NET 7 — no NuGet package needed, just `using Microsoft.AspNetCore.RateLimiting;` and `using System.Threading.RateLimiting;`.
+
+Minimal global policy, partitioned per client IP:
+
+```csharp
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 100,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+});
+```
+
+`app.UseRateLimiter()` goes after `UseRouting()`, before `UseCors`/`UseAuthorization` — reject abusive traffic before spending work on CORS/auth. Differentiate limits by trust level: an admin-auth-gated API can afford a higher `PermitLimit` than a public customer-facing endpoint.
+
+**This is a starting default, not a tuned production value** — say so explicitly in the commit/report. `PermitLimit`/`Window` need real traffic data to tune correctly; a wrong-but-present limiter is still strictly better than none on a codebase that's never had one, but don't imply it's been validated against real load.
+
+### 1.13 Output caching (`Microsoft.AspNetCore.OutputCaching`)
+
+Ask during Modernization: **which GET endpoints return data that's safe to serve slightly stale?** This is a genuine domain-risk question, not a mechanical one — do not apply broadly without checking what each candidate endpoint actually returns. The canonical trap: an availability/booking-check endpoint looks like a read-only GET and is a tempting caching target, but caching it risks serving a stale "available" result after another request just booked that slot — a real double-booking bug, not a theoretical one. Exclude anything time-sensitive or transactional from consideration outright.
+
+Safe candidates are pure reference/lookup data: enum-backed lookup tables, static country/language lists, rarely-edited admin-configured settings. If the endpoint's response would only change when an admin explicitly edits something (not because of concurrent user activity), it's a reasonable candidate.
+
+```csharp
+builder.Services.AddOutputCache(options =>
+{
+    options.AddPolicy("LookupData", p => p.Expire(TimeSpan.FromMinutes(10)));
+});
+// ...
+app.UseOutputCache(); // after UseAuthorization(), per Microsoft's guidance - avoids caching pre-auth-check responses
+```
+
+Apply via `[OutputCache(PolicyName = "LookupData")]` per action, not globally — this keeps the "is this endpoint safe to cache" decision visible at each call site instead of buried in one global default.
+
+### 1.14 Health checks (`Microsoft.Extensions.Diagnostics.HealthChecks`)
+
+Ask during Modernization: **is there a `/health` endpoint anywhere?** `grep -rn "AddHealthChecks"` — usually absent on a legacy codebase. Standard pattern for an ASP.NET Core project with EF Core:
+
+```csharp
+builder.Services.AddHealthChecks().AddDbContextCheck<TContext>();
+// ...
+app.MapHealthChecks("/health");
+```
+
+Needs the `Microsoft.Extensions.Diagnostics.HealthChecks.EntityFrameworkCore` package — check its EF Core version requirement against the solution's central EF Core version before adding; a patch-version mismatch (e.g. health-checks package requires EF Core `>=10.0.11` but the solution centrally pins `10.0.9`) produces a `CS1705`/`NU1109` immediately, requiring the whole EF Core family bumped together. Verify the higher version is EF Core's actual current release before bumping, not a speculative jump.
+
+**Azure Functions isolated worker doesn't have this endpoint-routing surface** — `[Function]`-attributed triggers aren't `app.Map*` endpoints, so `MapHealthChecks` doesn't apply directly. Add a lightweight HTTP-triggered function instead, following whatever HTTP-trigger pattern the rest of the Functions app already uses, checking dependency health manually (e.g. `await _context.Database.CanConnectAsync()`) and returning a simple status code.
+
+### 1.15 Passkeys (.NET 10)
 
 Built into `Microsoft.AspNetCore.Identity`, no extra package. `IdentityPasskeyOptions` (set `ServerDomain` explicitly), `signInManager.MakePasskeyCreationOptionsAsync` / `PerformPasskeyAttestationAsync` / `PasskeySignInAsync`, extension point `IPasskeyHandler<TUser>`. Storage via standard EF Identity migrations (`UserPasskeyInfo`) — **requires a new migration**.
 
@@ -485,4 +588,4 @@ Template asset versions bumped in .NET 9 (Bootstrap 5.3.3, jQuery 3.7.1) — sca
 2. Boot in Development — expect DI validation failures and multi-constructor middleware exceptions first.
 3. Verify behind the real proxy/IIS — forwarded headers, then cookie-auth 401/403.
 4. Verify observability — `SuppressDiagnosticsCallback`, W3C propagator, memory baselines.
-5. Then adopt, in ROI order: `MapStaticAssets` → `TypedResults`/route groups → built-in OpenAPI + Scalar → `AddValidation` → `IExceptionHandler`/ProblemDetails → HybridCache → ServiceDefaults/OTel → SSE → passkeys.
+5. Then adopt, in ROI order: `MapStaticAssets` → `TypedResults`/route groups → built-in OpenAPI + Scalar → `AddValidation` → `IExceptionHandler`/ProblemDetails → HybridCache → ServiceDefaults/OTel → classic Application Insights → OpenTelemetry migration (§1.11, if applicable) → health checks (§1.14) → rate limiting (§1.12) → output caching (§1.13, only after auditing which endpoints are actually safe) → SSE → passkeys.
