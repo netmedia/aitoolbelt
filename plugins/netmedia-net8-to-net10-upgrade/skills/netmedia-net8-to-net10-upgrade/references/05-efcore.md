@@ -2,7 +2,7 @@
 
 EF Core 10 **requires `net10.0`** — no `net8.0`/`net9.0` asset exists, and no multi-targeting is possible. EF Core 8 support ends 2026-11-10.
 
-Contents: [Packages](#packages-and-version-alignment) · [Breaking: EF 9](#breaking-changes--ef-core-9) · [Breaking: EF 10](#breaking-changes--ef-core-10) · [Migration mechanics](#migration-mechanics) · [Silent behaviour changes](#silent-behaviour-changes) · [Adopt](#what-to-adopt)
+Contents: [Packages](#packages-and-version-alignment) · [Breaking: EF 9](#breaking-changes--ef-core-9) · [Breaking: EF 10](#breaking-changes--ef-core-10) · [Migration mechanics](#migration-mechanics) · [Design-time vs runtime divergence](#design-time-vs-runtime-model-divergence--why-has-pending-model-changes-can-report-clean-while-migrate-still-throws) · [Silent behaviour changes](#silent-behaviour-changes) · [Adopt](#what-to-adopt)
 
 ## Packages and version alignment
 
@@ -176,6 +176,55 @@ Assert.False(context.Database.HasPendingModelChanges());
 | Concurrency lock | none | DB lock | DB lock |
 | External transaction around `Migrate()` | allowed | throws | throws |
 | Pending model changes at `Migrate()` | ignored | throws | throws |
+
+### Design-time vs runtime model divergence — why `has-pending-model-changes` can report clean while `Migrate()` still throws
+
+`Add-Migration`/`has-pending-model-changes` build their "current model" through whatever `IDesignTimeDbContextFactory<TContext>` the project exposes (EF tooling always prefers this over the app's own `Program.cs`/DI path, if one exists). The running app builds its model through its normal DI-registered `AddDbContext<TContext>(...)`. Both paths execute the *identical* `OnModelCreating` — but if `OnModelCreating` (directly or via a base class, e.g. `IdentityDbContext`) reads anything from the **application service provider** rather than from `DbContextOptionsBuilder` itself, the two paths can silently compute different models, and only `Migrate()`'s `PendingModelChangesWarning` check catches it — at runtime, in production, not in CI, not from the CLI.
+
+The concrete, repeatable case: `AddIdentity<TUser,TRole>(options => options.Stores.MaxLengthForKeys = 128)` in `Program.cs`. ASP.NET Core Identity's own `OnModelCreating` resolves `IdentityOptions` via `this.GetService<IOptions<IdentityOptions>>()` — the DbContext's *application* service provider, set via `optionsBuilder.UseApplicationServiceProvider(...)`. A hand-rolled `IDesignTimeDbContextFactory` that just does `new DbContextOptionsBuilder<T>().UseSqlServer(cs)` has no such provider configured, so Identity silently falls back to its own raw default (`450`, sized to fit one `nvarchar` column within SQL Server's 900-byte composite index key limit) instead of the app's real `128`. Symptom sequence exactly as reported by a developer hitting this cold: app crashes at startup with `PendingModelChangesWarning`; `Add-Migration` scaffolds an **empty** migration (design-time model already silently agrees with the stale snapshot, for the wrong reason); `Update-Database` reports nothing to apply (same reason) — the two commands the error message points you at are both lying, because they're comparing the wrong "current" model in the first place.
+
+**Fix pattern:** give the design-time factory the same application-service-provider content the app's DI container has, scoped to just what `OnModelCreating` actually reads:
+
+```csharp
+protected override void ConfigureAdditionalOptions(DbContextOptionsBuilder<TContext> optionsBuilder)
+{
+    var services = new ServiceCollection();
+    services.AddOptions<IdentityOptions>().Configure(o => o.Stores.MaxLengthForKeys = 128); // must match Program.cs exactly
+    optionsBuilder.UseApplicationServiceProvider(services.BuildServiceProvider());
+}
+```
+
+**Diagnosing which case you're in, without a decompiler:** temporarily add a throwaway diff right before the app's `Migrate()` call (revert before shipping — this is a diagnostic, not a fix):
+
+```csharp
+var migrationsAssembly = context.GetService<IMigrationsAssembly>();
+var designTimeModel = context.GetService<IDesignTimeModel>().Model;
+var lastMigrationModel = migrationsAssembly.ModelSnapshot?.Model;
+var oldProps = lastMigrationModel.GetEntityTypes().SelectMany(e => e.GetProperties())
+    .ToDictionary(p => p.DeclaringType.Name + "." + p.Name, p => p);
+foreach (var newProp in designTimeModel.GetEntityTypes().SelectMany(e => e.GetProperties()))
+{
+    if (!oldProps.TryGetValue(newProp.DeclaringType.Name + "." + newProp.Name, out var oldProp)) continue;
+    if (newProp.GetMaxLength() != oldProp.GetMaxLength() || newProp.GetColumnType() != oldProp.GetColumnType())
+        Console.WriteLine($"{newProp.DeclaringType.Name}.{newProp.Name}: {oldProp.GetMaxLength()}/{oldProp.GetColumnType()} -> {newProp.GetMaxLength()}/{newProp.GetColumnType()}");
+}
+```
+
+Comparing property-level facets this way sidesteps `IMigrationsModelDiffer.GetDifferences()`'s `IRelationalModel` requirement, which throws `"The model must be finalized..."` unless both sides are independently finalized via `IModelRuntimeInitializer` first — not worth fighting for a one-off diagnostic. Run this from the actual failing process (not the CLI) to see what the *runtime* path computes; cross-reference against what `Add-Migration`'s generated `.Designer.cs` recorded for the same properties to see what the *design-time* path computed. A mismatch confined to one framework's own entity types (Identity, in this case) is the signature of this bug class.
+
+**A second, independent bug can look identical and stack with this one:** any custom `IEntityFrameworkEntityPropertyConvention`-style helper that guards a default with `property.FindAnnotation("MaxLength") != null` (checking a generic annotation by name) rather than `property.GetMaxLength() != null` (the real API) is checking a storage location EF Core has, in recent versions, largely moved off of — well-known facets like `MaxLength`/`Precision`/`Scale`/`IsUnicode` are first-class property state, not generic annotations, in modern EF Core. Such a guard silently stops detecting "already configured" and starts unconditionally overwriting, including onto values a framework base class (like `IdentityDbContext`) or another part of the app deliberately set. Audit any solution-wide default-facet convention for this exact pattern during an EF Core version bump — it won't be a compile error, and it can produce non-deterministic results depending on convention execution order between the custom convention and the framework's own (often deferred) configuration.
+
+### Narrowing a column that's part of a composite primary key
+
+SQL Server allows widening an indexed/PK `nvarchar` column via `ALTER COLUMN` in place, but refuses to narrow one: `Error 5074: The object 'PK_X' is dependent on column 'Y'. ALTER TABLE ALTER COLUMN Y failed because one or more objects access this column.` EF Core's migration scaffolder does not reliably detect this and add the necessary constraint drop/recreate — a scaffolded `AlterColumn` narrowing a PK column may need `DropPrimaryKey`/`AddPrimaryKey` added by hand around it, in both `Up()` and `Down()`:
+
+```csharp
+migrationBuilder.DropPrimaryKey(name: "PK_X", table: "X");
+migrationBuilder.AlterColumn<string>(name: "Y", table: "X", type: "nvarchar(128)", maxLength: 128, /* ... */);
+migrationBuilder.AddPrimaryKey(name: "PK_X", table: "X", columns: new[] { "Y", "Z" });
+```
+
+Get the real constraint name and column order from the database, not by guessing from convention (`sys.key_constraints` joined to `sys.index_columns`) — EF's default naming convention usually matches, but don't assume it for a table whose PK may have been customized.
 
 ## Silent behaviour changes
 
