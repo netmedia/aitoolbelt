@@ -54,9 +54,27 @@
   </ItemGroup>
 
   <ItemGroup Label="Azure Functions (isolated worker)">
+    <!--
+      Worker, Worker.Grpc, and Worker.Core must all resolve to the SAME version -
+      each Worker/Worker.Grpc release's own nuspec hard-pins one exact Worker.Core
+      version, and the gRPC wire types between host and worker (e.g.
+      DefaultTraceContext) are not binary-compatible across Worker.Core releases.
+      If you add any other Functions extension with a higher Worker.Core floor
+      (most commonly Microsoft.Azure.Functions.Worker.OpenTelemetry -
+      references/04-aspnetcore.md §1.11), CentralPackageTransitivePinningEnabled
+      will silently bump ONLY Worker.Core to satisfy it - the mismatch builds
+      clean and fails every function invocation at runtime with a
+      MissingMethodException. Bump FunctionsWorkerVersion (and re-verify
+      Worker.Grpc/Sdk here) to a release whose own pinned Worker.Core meets the
+      highest floor across every extension package before shipping - see
+      references/06-functions.md.
+    -->
     <PackageVersion Include="Microsoft.Azure.Functions.Worker" Version="$(FunctionsWorkerVersion)" />
+    <PackageVersion Include="Microsoft.Azure.Functions.Worker.Grpc" Version="$(FunctionsWorkerVersion)" />
     <PackageVersion Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.1.0" />
     <PackageVersion Include="Microsoft.Azure.Functions.Worker.Extensions.Http.AspNetCore" Version="2.1.1" />
+    <!-- Only add if this project adopts OpenTelemetry (§1.11) - verify its Worker.Core floor against FunctionsWorkerVersion's own pinned Worker.Core first. -->
+    <!-- <PackageVersion Include="Microsoft.Azure.Functions.Worker.OpenTelemetry" Version="1.2.0" /> -->
   </ItemGroup>
 
   <ItemGroup Label="Testing">
