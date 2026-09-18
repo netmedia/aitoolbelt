@@ -63,6 +63,23 @@ Why it matters for this upgrade specifically:
 
 Gotchas: only the **nearest** `Directory.Packages.props` is evaluated; `NU1507` if multiple sources are configured without package source mapping.
 
+**`NU1507` is not just cosmetic — it can hard-fail `Add-Migration`/`Update-Database` in Visual Studio's Package Manager Console.** PMC's PowerShell host runs with `$ErrorActionPreference = 'Stop'`; a stray `NU1507` line surfacing during the console's implicit restore-and-build gets treated as a terminating error ("The running command stopped because the preference variable...") and aborts the migration command entirely — even though the same warning is harmless noise from `dotnet build`/`dotnet ef` on the CLI. Fix at the source rather than chasing the PMC symptom: add `<packageSourceMapping>` to `NuGet.config`, mapping the org's private feed(s) to their actual package-name prefix and everything else to `nuget.org` as the catch-all:
+
+```xml
+<packageSourceMapping>
+  <packageSource key="nuget.org">
+    <package pattern="*" />
+  </packageSource>
+  <packageSource key="mycompany.feed">
+    <package pattern="MyCompany.*" />
+  </packageSource>
+</packageSourceMapping>
+```
+
+The catch-all on `nuget.org` also covers transitive dependencies *of* the private-feed packages (e.g. a UI component library's own third-party deps) — don't scope `nuget.org`'s pattern narrowly or restore breaks on those. After adding the mapping, force a clean restore of every real project (not just the one that showed the warning) to confirm no package resolves to zero sources under the new mapping.
+
+**While in `Directory.Packages.props`/`NuGet.config` for this pass, audit for `PackageReference`s that are unused in code but drag in legacy transitive dependencies.** The concrete failure mode seen in the field: a project referenced `LinqKit` with zero actual usages (no `using LinqKit;`, no `PredicateBuilder`, no `AsExpandable()` anywhere in the solution) — but `LinqKit`'s nuspec unconditionally depends on the legacy `EntityFramework` (EF6) package for every target framework group, including `.NETStandard2.1`. Visual Studio's PMC detects *any* EF6 package anywhere in the loaded solution and silently defaults `Add-Migration`/`Update-Database` to the EF6 PowerShell module instead of `EntityFrameworkCore\Add-Migration`, producing "Both Entity Framework 6 and Entity Framework Core are installed" even on a project with no EF6 code at all. `grep -rn "\"EntityFramework/"  **/obj/project.assets.json` (excluding `EntityFrameworkCore`) surfaces this fast; cross-reference the owning package via each hit's `dependencies` block, then check whether that package is actually used in code before deciding whether to remove it, swap to a non-EF6 variant (e.g. `LinqKit` → `LinqKit.Core`), or keep it and accept the PMC friction.
+
 Docs: [central-package-management](https://learn.microsoft.com/en-us/nuget/consume-packages/central-package-management)
 
 ## .slnx

@@ -24,6 +24,7 @@ Rules:
 2. Third-party providers: **major version must equal the EF Core major version**. Providers declare `Relational (>= N.0.0 && <= N.0.999)`; NuGet hard-fails on mismatch.
 3. `dotnet-ef` tool version ≥ the runtime version: `dotnet tool update --global dotnet-ef`. EF 10 tooling still works against EF 8/9 runtime projects but needs the .NET 10 SDK.
 4. Take the latest patch — verify on nuget.org at upgrade time; these move monthly.
+5. **If Visual Studio's Package Manager Console runs `Add-Migration`/`Update-Database` against the EF6 tools instead of EF Core** ("Both Entity Framework 6 and Entity Framework Core are installed..."), some package in the solution — not necessarily an EF-related one — has a transitive dependency on the legacy `EntityFramework` package. PMC scans the whole loaded solution, not just the target project. See `01-solution-hygiene.md`'s CPM section for the diagnosis/fix pattern (grep `project.assets.json` for `"EntityFramework/`, trace the owning package, remove it if unused or swap to its EF6-free variant).
 
 **Provider status (verify before planning):**
 
