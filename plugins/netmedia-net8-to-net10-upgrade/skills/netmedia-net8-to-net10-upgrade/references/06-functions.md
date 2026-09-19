@@ -1,6 +1,6 @@
 # Azure Functions → .NET 10 isolated worker
 
-Contents: [Support matrix](#support-matrix) · [csproj](#reference-csproj) · [Packages](#binding-extension-packages) · [Config](#hostjson-local-settings-and-app-settings) · [In-process → isolated](#in-process--isolated-migration) · [Durable](#durable-functions) · [Deployment](#deployment-procedure) · [Hosting plans](#hosting-plans)
+Contents: [Support matrix](#support-matrix) · [csproj](#reference-csproj) · [Packages](#binding-extension-packages) · [Config](#hostjson-local-settings-and-app-settings) · [In-process → isolated](#in-process--isolated-migration) · [OpenAPI & Scalar](#openapi-and-scalar) · [Durable](#durable-functions) · [Deployment](#deployment-procedure) · [Hosting plans](#hosting-plans)
 
 **.NET 8 and the in-process model both end support on 2026-11-10.** .NET 10 is not supported in-process at all, so the model migration is a hard prerequisite, not cleanup.
 
@@ -205,6 +205,65 @@ public class MyOutputType
     [HttpResult] public IActionResult Result { get; set; }
     [QueueOutput("myQueue")] public string MessageText { get; set; }
 }
+```
+
+### OpenAPI and Scalar
+
+There is no `AddOpenApi()` equivalent for isolated-worker Functions — Functions triggers aren't registered as routed endpoints the way minimal APIs are, so nothing can auto-infer an OpenAPI document from them. The closest equivalent is the community/Microsoft-maintained `Microsoft.Azure.Functions.Worker.Extensions.OpenApi` package (latest stable `1.6.0` at time of writing; verify its `Microsoft.Azure.Functions.Worker.Core` floor against the pinned Functions Worker version before adding it — this package's floor is a low `>= 1.8.0`, so it's unlikely to trigger the Worker/Worker.Grpc/Worker.Core lockstep problem above, but check anyway). Every operation needs explicit `[OpenApiOperation]`/`[OpenApiParameter]`/`[OpenApiResponseWithBody]` attributes; there's no free inference like `AddOpenApi()` gives ASP.NET Core Web APIs.
+
+**Wiring it up with `FunctionsApplication.CreateBuilder()` (the newer minimal-hosting builder) needs a workaround.** The package's own `ConfigureOpenApi()` extension targets `IHostBuilder` — the older `Host.CreateDefaultBuilder().ConfigureFunctionsWorkerDefaults()` pattern — which `FunctionsApplicationBuilder` doesn't implement, so it won't compile. Its actual effect (checked against the package's GitHub source) is just two DI registrations:
+
+```csharp
+builder.Services.AddSingleton<IOpenApiHttpTriggerContext, OpenApiHttpTriggerContext>();
+builder.Services.AddSingleton<IOpenApiTriggerFunction, OpenApiTriggerFunction>();
+```
+
+Register these directly against `builder.Services` (a plain `IServiceCollection` on `FunctionsApplicationBuilder`) instead of trying to call the extension method.
+
+**The version segment in `/api/openapi/{version}.json` means spec version, not document name — `v1` 500s.** Unlike ASP.NET Core's `AddOpenApi()` convention (where the URL segment is a document *name*, defaulting to `"v1"`), this package's default JSON endpoint is `/api/swagger.json` (Swagger 2.0), and its separate `/api/openapi/{version}.json` route expects an actual OpenAPI spec version token — `v2` for a Swagger-2.0-shaped document, `v3` for real OpenAPI 3.x (confirmed empirically: `/api/openapi/v3.json` returns `"openapi": "3.0.1"`). Passing `v1` there throws "Invalid OpenAPI version" as a 500, not a 404 — easy to mistake for a broken setup rather than a wrong URL guess.
+
+**`Scalar.AspNetCore`'s `MapScalarApiReference()` can't attach to the Functions host at all** — it needs a real ASP.NET Core `IEndpointRouteBuilder`, which `FunctionsApplicationBuilder`/`IHost` doesn't expose even with the HTTP/ASP.NET Core integration package installed (Functions routes are dispatched through the Functions host, not ASP.NET Core endpoint routing). Use Scalar's own documented framework-agnostic CDN embed instead — a plain HTTP-triggered function (mark it `[OpenApiIgnore]` so it doesn't document itself) returning:
+
+```html
+<div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+<script>
+    Scalar.createApiReference('#app', { url: '/api/openapi/v3.json', layout: 'classic' })
+</script>
+```
+
+Trade-off: this loads Scalar's JS from a public CDN at runtime rather than self-hosting it, unlike `Scalar.AspNetCore`'s ASP.NET Core embedded-resource approach — fine for internal/dev tooling, worth reconsidering for strict CSP or offline environments.
+
+**No config switch removes just the package's Swagger-branded endpoints while keeping the real OpenAPI 3.x one.** `RenderSwaggerDocument` (`/api/swagger.json`), `RenderSwaggerUI` (`/api/swagger/ui`), `RenderOAuth2Redirect`, and `RenderOpenApiDocument` (`/api/openapi/{version}.json`) are all methods on the one class registered above — `DefaultOpenApiConfigurationOptions` has no per-endpoint on/off flag, and all four are dispatched as genuine, individually-invoked Azure Functions the moment `IOpenApiTriggerFunction` is registered (confirmed via the host's own logs: `Executing 'Functions.RenderSwaggerDocument'`). Removing the package or its DI registration drops the real OpenAPI endpoint along with the Swagger ones. To keep only the OpenAPI-branded surface, block the Swagger-specific ones by name in an `IFunctionsWorkerMiddleware`:
+
+```csharp
+public class DisableSwaggerEndpointsMiddleware : IFunctionsWorkerMiddleware
+{
+    private static readonly HashSet<string> _blocked = new(StringComparer.OrdinalIgnoreCase)
+        { "RenderSwaggerDocument", "RenderSwaggerUI", "RenderOAuth2Redirect" };
+
+    public async Task Invoke(FunctionContext context, FunctionExecutionDelegate next)
+    {
+        if (_blocked.Contains(context.FunctionDefinition.Name))
+        {
+            var request = await context.GetHttpRequestDataAsync();
+            if (request != null)
+            {
+                var response = request.CreateResponse();
+                response.StatusCode = HttpStatusCode.NotFound;
+                context.GetInvocationResult().Value = response;
+                return;
+            }
+        }
+        await next(context);
+    }
+}
+// builder.UseMiddleware<DisableSwaggerEndpointsMiddleware>(); right after ConfigureFunctionsWebApplication()
+```
+
+**`launchSettings.json`'s `launchBrowser` defaults to `false` for Functions projects** — unlike Web API/MVC project templates, which default to `true` with a `launchUrl`. If you want F5/`dotnet run` to open straight to your API docs UI (Scalar, Swagger UI, whatever), add both explicitly:
+```json
+{ "launchBrowser": true, "launchUrl": "api/scalar" }
 ```
 
 ### Middleware (isolated only)
